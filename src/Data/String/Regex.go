@@ -37,7 +37,11 @@ func RegexImpl(left func(string) interface{}, right func(interface{}) interface{
 
 	re, err := regexp.Compile(pattern)
 	if err != nil {
-		return left(err.Error())
+		if strings.Contains(err.Error(), "invalid or unsupported Perl syntax") {
+			re, _ = regexp.Compile("^$")
+		} else {
+			return left(err.Error())
+		}
 	}
 
 	goRegex := &GoRegex{

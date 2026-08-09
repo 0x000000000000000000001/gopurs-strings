@@ -25,8 +25,14 @@ func RegexImpl(left func(string) interface{}, right func(interface{}) interface{
 	}
 
 	pattern := s1
+
+	jsUnicodeEsc1 := regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
+	jsUnicodeEsc2 := regexp.MustCompile(`\\u\{([0-9a-fA-F]+)\}`)
+	pattern = jsUnicodeEsc1.ReplaceAllString(pattern, `\x{${1}}`)
+	pattern = jsUnicodeEsc2.ReplaceAllString(pattern, `\x{${1}}`)
+
 	if flags != "" {
-		pattern = "(?" + flags + ")" + s1
+		pattern = "(?" + flags + ")" + pattern
 	}
 
 	re, err := regexp.Compile(pattern)

@@ -4,9 +4,11 @@
 !/.github/
 /bower_components/
 /node_modules/
-/output/
+output/
+output.bak/
 package-lock.json
 .DS_Store
 .spago
 output
+output.bak
 .psc-ide-port

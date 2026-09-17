@@ -1,6 +1,6 @@
 // Compare the actual JS and Go FFI without compiling PureScript.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -38,7 +38,7 @@ try {
   writeFileSync(join(workspace, "Unsafe.go"), "package codeunits\nimport \"gopurs/output/gopurs_runtime\"\n" + readFileSync(new URL("../src/Data/String/Unsafe.go", import.meta.url), "utf8"));
   copyFileSync(fileURLToPath(new URL("./code-units-native_test.go", import.meta.url)), join(workspace, "code_units_test.go"));
   const runtime = join(workspace, "gopurs_runtime");
-  execFileSync("mkdir", [runtime]);
+  mkdirSync(runtime);
   copyFileSync(fileURLToPath(new URL("../../gopurs/runtime/runtime.go", import.meta.url)), join(runtime, "runtime.go"));
   writeFileSync(join(workspace, "go.mod"), "module gopurs/output\n\ngo 1.22\n");
   writeFileSync(join(workspace, "fixtures.json"), JSON.stringify(cases));

@@ -25,6 +25,20 @@ func RegexImpl(left func(string) interface{}, right func(interface{}) interface{
 	}
 
 	pattern := s1
+	// The CST lexer excludes punctuation before accepting a Unicode symbol.
+	// P and S are disjoint general categories, so this particular lookahead is
+	// redundant. Match the complete lexer expression to leave other patterns
+	// and their capture groups unchanged.
+	if pattern == `^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|(?!\p{P})\p{S})+)` {
+		pattern = `^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|\p{S})+)`
+	}
+	// Stop at the first closing delimiter, just as the lookahead does. Trying
+	// the delimiter before another repetition preserves both capture groups
+	// and handles unterminated comments without ever matching empty input.
+	// The CST uses only u; multiline $ would make this reduction invalid.
+	if pattern == `^(?:\{-(-(?!\})|[^-]+)*(-\}|$))` && !strings.Contains(s2, "m") {
+		pattern = `^(?:\{-(-|[^-]+)*?(-\}|$))`
+	}
 
 	jsUnicodeEsc1 := regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
 	jsUnicodeEsc2 := regexp.MustCompile(`\\u\{([0-9a-fA-F]+)\}`)

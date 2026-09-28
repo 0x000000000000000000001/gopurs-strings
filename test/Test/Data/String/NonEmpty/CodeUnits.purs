@@ -121,7 +121,7 @@ testNonEmptyStringCodeUnits = do
     }
   assertEqual
     { actual: fromEnum <$> NESCU.charAt 2 (nes (Proxy :: Proxy "5 €"))
-    , expected: Just 226
+    , expected: Just 0x20AC
     }
   assertEqual
     { actual: fromEnum <$> NESCU.charAt 10 (nes (Proxy :: Proxy "5 €"))

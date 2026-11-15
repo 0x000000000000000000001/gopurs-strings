@@ -125,16 +125,46 @@ func _ToChar(just func(string) interface{}, nothing interface{}, str string) int
 }
 
 func Length(s string) int {
-	count := 0
-	for i := 0; i < len(s); {
-		r, size := decodeUnitRune(s[i:])
-		count++
-		if r > 0xffff {
-			count++
+	// UTF-16 units equal bytes on ASCII runs, which are almost all of a
+	// PureScript source file. The CST lexer compares lengths of the remaining
+	// input after every failed alternative, so decoding every rune here made
+	// lexing quadratic in module size. Count valid non-ASCII sequences from
+	// their lead byte; overlong, out-of-range and truncated sequences fall back
+	// to the decoder, so malformed input is counted exactly as before.
+	units := 0
+	i := 0
+	for i < len(s) {
+		j := i
+		for j < len(s) && s[j] < utf8.RuneSelf {
+			j++
 		}
-		i += size
+		units += j - i
+		i = j
+		if i >= len(s) {
+			break
+		}
+		b := s[i]
+		switch {
+		case b >= 0xc2 && b <= 0xdf && i+1 < len(s) && s[i+1]&0xc0 == 0x80:
+			units++
+			i += 2
+		case b >= 0xe0 && b <= 0xef && i+2 < len(s) && s[i+1]&0xc0 == 0x80 && s[i+2]&0xc0 == 0x80 && (b != 0xe0 || s[i+1] >= 0xa0):
+			units++
+			i += 3
+		case b >= 0xf0 && b <= 0xf4 && i+3 < len(s) && s[i+1]&0xc0 == 0x80 && s[i+2]&0xc0 == 0x80 && s[i+3]&0xc0 == 0x80 && (b != 0xf0 || s[i+1] >= 0x90) && (b != 0xf4 || s[i+1] <= 0x8f):
+			units += 2
+			i += 4
+		default:
+			r, size := decodeUnitRune(s[i:])
+			if r > 0xffff {
+				units += 2
+			} else {
+				units++
+			}
+			i += size
+		}
 	}
-	return count
+	return units
 }
 
 func CountPrefix(p func(string) bool, str string) int {
@@ -187,7 +217,35 @@ func _IndexOf(just func(int) interface{}, nothing interface{}, x string, s strin
 	return _IndexOfStartingAt(just, nothing, x, 0, s)
 }
 
+// A pattern made only of BMP, non-surrogate code points is encoded the same way
+// in UTF-8/WTF-8 wherever its code units match, so a byte search is exact for
+// it. Supplementary scalars and isolated surrogates must use the code-unit path
+// because the same UTF-16 units can have two encodings.
+func isBMPText(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := decodeUnitRune(s[i:])
+		if r > 0xffff || (r >= 0xd800 && r <= 0xdfff) {
+			return false
+		}
+		i += size
+	}
+	return true
+}
+
 func _IndexOfStartingAt(just func(int) interface{}, nothing interface{}, x string, startIdx int, str string) interface{} {
+	if startIdx >= 0 {
+		begin, split := unitBoundary(str, startIdx)
+		if !split && isBMPText(x) {
+			if startIdx > 0 && begin == len(str) && startIdx != Length(str) {
+				return nothing
+			}
+			off := strings.Index(str[begin:], x)
+			if off < 0 {
+				return nothing
+			}
+			return just(startIdx + Length(str[begin:begin+off]))
+		}
+	}
 	input, pattern := stringUnits(str), stringUnits(x)
 	if startIdx < 0 || startIdx > len(input) || startIdx+len(pattern) > len(input) {
 		return nothing
@@ -256,7 +314,20 @@ func Drop(idx int, str string) string {
 	if idx <= 0 {
 		return str
 	}
-	return sliceUnits(str, idx, Length(str))
+	// Dropping a prefix only needs the boundary of the cut: computing
+	// Length(str) here made every drop O(len(str)), which turned token-by-token
+	// lexing into quadratic work. unitBoundary already handles a cut inside a
+	// supplementary scalar, which must keep the low surrogate.
+	begin, split := unitBoundary(str, idx)
+	if begin >= len(str) {
+		return ""
+	}
+	if !split {
+		return str[begin:]
+	}
+	r, size := decodeUnitRune(str[begin:])
+	_, lo := utf16.EncodeRune(r)
+	return unitString(uint16(lo)) + str[begin+size:]
 }
 
 func Slice(start int, end int, str string) string {

@@ -57,5 +57,29 @@ testStringRegex = do
   assert $ test pattern "a"
   assert $ test pattern "a"
 
+
+  log "lookaround and backreferences"
+  assert $ test (unsafeRegex "a(?=b)" noFlags) "ab"
+  assert $ not (test (unsafeRegex "a(?=b)" noFlags) "ac")
+  assert $ test (unsafeRegex "(?<=a)b" noFlags) "ab"
+  assert $ test (unsafeRegex "(?<!a)b" noFlags) "cb"
+  assert $ test (unsafeRegex "(a)\\1" noFlags) "aa"
+  assert $ match (unsafeRegex "(?<first>x)(y)\\k<first>" noFlags) "xyx" == Just (nea [Just "xyx", Just "x", Just "y"])
+  assert $ match (unsafeRegex "(a*)()(b)?" noFlags) "aa" == Just (nea [Just "aa", Just "aa", Just "", Nothing])
+
+  log "Unicode indices and flags"
+  assert $ search (unsafeRegex "b" (parseFlags "u")) "😀b" == Just 2
+  assert $ match (unsafeRegex "." (parseFlags "gu")) "😀x" == Just (nea [Just "😀", Just "x"])
+  assert $ not (test (unsafeRegex "." noFlags) "\x2028")
+  assert $ test (unsafeRegex "^a$" (parseFlags "m")) "x\ra\ry"
+  assert $ not (test (unsafeRegex "a" (parseFlags "y")) "ba")
+  assert $ flags (unsafeRegex "a" (parseFlags "y")) == parseFlags "y"
+  assert $ flags (unsafeRegex "a" noFlags) == noFlags
+
+  log "replacement and split contracts"
+  assert $ replace (unsafeRegex "(a)(b)?" noFlags) "$1/$2/$$/$&" "a" == "a//$/a"
+  assert $ replace (unsafeRegex "(?<first>x)(y)" noFlags) "$<first>-$2" "xy" == "x-y"
+  assert $ split (unsafeRegex "(,)" noFlags) "a,b" == ["a", ",", "b"]
+
 nea :: Array ~> NonEmptyArray
 nea = unsafePartial fromJust <<< fromArray

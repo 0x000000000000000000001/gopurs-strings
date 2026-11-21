@@ -5,6 +5,9 @@
 This checkout is part of the gopurs library family. Use the
 [local Go development guide](../gopurs/README.md#develop-one-library-locally)
 for toolchain setup, sibling dependencies, Spago configuration and Go commands.
+The [native regex contract](docs/go-regex.md) documents the pinned Go dependency,
+qualified JavaScript compatibility, lexer measurements and remaining limits.
+
 The existing npm, Bower and Dhall commands below retain their JavaScript or
 upstream roles.
 

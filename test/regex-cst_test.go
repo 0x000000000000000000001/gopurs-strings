@@ -17,6 +17,7 @@ func TestCSTRegexMatchesJavaScript(t *testing.T) {
 		Flags   string
 		Input   string
 		Want    any
+		Fast    bool
 	}
 	if err := json.Unmarshal(data, &fixtures); err != nil {
 		t.Fatal(err)
@@ -34,21 +35,19 @@ func TestCSTRegexMatchesJavaScript(t *testing.T) {
 		if regex.Source != fixture.Pattern || regex.Flags != fixture.Flags {
 			t.Fatal("regex source or flags changed")
 		}
+		if fixture.Fast && regex.cst == nil {
+			t.Fatalf("missing qualified fast path: %q", fixture.Pattern)
+		}
 		got := _Match(func(value any) any { return value }, nil, regex, fixture.Input)
+		if regex.cst != nil {
+			regex.cst = nil
+			general := _Match(func(value any) any { return value }, nil, regex, fixture.Input)
+			if !reflect.DeepEqual(general, fixture.Want) {
+				t.Fatalf("general pattern %q input %q: got %#v want %#v", fixture.Pattern, fixture.Input, general, fixture.Want)
+			}
+		}
 		if !reflect.DeepEqual(got, fixture.Want) {
 			t.Fatalf("pattern %q input %q: got %#v, want %#v", fixture.Pattern, fixture.Input, got, fixture.Want)
 		}
-	}
-}
-
-func TestBlockCommentMultilineKeepsExistingUnsupportedBehavior(t *testing.T) {
-	// The CST-specific reduction is invalid with multiline $. Keep this
-	// unsupported variant out of it, rather than silently returning "{-".
-	regex := RegexImpl(func(message string) any {
-		t.Fatal(message)
-		return nil
-	}, func(value any) any { return value }, `^(?:\{-(-(?!\})|[^-]+)*(-\}|$))`, "um").(*GoRegex)
-	if got := _Match(func(value any) any { return value }, nil, regex, "{-\na-}"); got != nil {
-		t.Fatalf("multiline expression incorrectly used CST reduction: %#v", got)
 	}
 }

@@ -1,208 +1,576 @@
 package Regex
 
 import (
+	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
+	"unicode/utf16"
+	"unicode/utf8"
+
+	"github.com/dlclark/regexp2"
 )
 
+// regexp2 v1.11.5 supports Go 1.13 and preserves gopurs' Go 1.22 minimum.
+// ECMAScript mode is a compatibility subset, not a complete JS RegExp engine.
+// See docs/go-regex.md for the qualified cases and explicit limitations.
 type GoRegex struct {
-	Re     *regexp.Regexp
+	Re     *regexp2.Regexp
 	Global bool
 	Flags  string
 	Source string
+	names  map[string]int
+	cst    *regexp.Regexp
 }
 
-func RegexImpl(left func(string) interface{}, right func(interface{}) interface{}, s1 string, s2 string) interface{} {
-	flags := ""
-	if strings.Contains(s2, "i") {
-		flags += "i"
-	}
-	if strings.Contains(s2, "m") {
-		flags += "m"
-	}
-	if strings.Contains(s2, "s") {
-		flags += "s"
-	}
-
-	pattern := s1
-	// The CST lexer excludes punctuation before accepting a Unicode symbol.
-	// P and S are disjoint general categories, so this particular lookahead is
-	// redundant. Match the complete lexer expression to leave other patterns
-	// and their capture groups unchanged.
-	if pattern == `^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|(?!\p{P})\p{S})+)` {
-		pattern = `^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|\p{S})+)`
-	}
-	// Stop at the first closing delimiter, just as the lookahead does. Trying
-	// the delimiter before another repetition preserves both capture groups
-	// and handles unterminated comments without ever matching empty input.
-	// The CST uses only u; multiline $ would make this reduction invalid.
-	if pattern == `^(?:\{-(-(?!\})|[^-]+)*(-\}|$))` && !strings.Contains(s2, "m") {
-		pattern = `^(?:\{-(-|[^-]+)*?(-\}|$))`
-	}
-
-	jsUnicodeEsc1 := regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
-	jsUnicodeEsc2 := regexp.MustCompile(`\\u\{([0-9a-fA-F]+)\}`)
-	pattern = jsUnicodeEsc1.ReplaceAllString(pattern, `\x{${1}}`)
-	pattern = jsUnicodeEsc2.ReplaceAllString(pattern, `\x{${1}}`)
-
-	if flags != "" {
-		pattern = "(?" + flags + ")" + pattern
-	}
-
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		if strings.Contains(err.Error(), "invalid or unsupported Perl syntax") {
-			re, _ = regexp.Compile("^$")
+// Matching runs on UTF-16 units without u, and Unicode scalars with u. Keep
+// isolated surrogates in canonical WTF-8, as in the native CodeUnits module.
+func regexRunes(s string, unicode bool) []rune {
+	out := make([]rune, 0, len(s))
+	for len(s) > 0 {
+		var r rune
+		var size int
+		if len(s) >= 3 && s[0] == 0xed && s[1] >= 0xa0 && s[1] <= 0xbf && s[2]&0xc0 == 0x80 {
+			r, size = rune(s[0]&15)<<12|rune(s[1]&63)<<6|rune(s[2]&63), 3
 		} else {
-			return left(err.Error())
+			r, size = utf8.DecodeRuneInString(s)
+		}
+		if !unicode && r > 0xffff {
+			a, b := utf16.EncodeRune(r)
+			out = append(out, a, b)
+		} else {
+			out = append(out, r)
+		}
+		s = s[size:]
+	}
+	return out
+}
+
+func regexString(rs []rune) string {
+	var b strings.Builder
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		if r >= 0xd800 && r <= 0xdbff && i+1 < len(rs) && rs[i+1] >= 0xdc00 && rs[i+1] <= 0xdfff {
+			r = utf16.DecodeRune(r, rs[i+1])
+			i++
+		}
+		if r >= 0xd800 && r <= 0xdfff {
+			b.Write([]byte{0xed, 0x80 | byte(r>>6&63), 0x80 | byte(r&63)})
+		} else {
+			b.WriteRune(r)
 		}
 	}
-
-	goRegex := &GoRegex{
-		Re:     re,
-		Global: strings.Contains(s2, "g"),
-		Flags:  s2,
-		Source: s1,
-	}
-	return right(goRegex)
+	return b.String()
 }
 
-func _ReplaceBy(just func(interface{}) interface{}, nothing interface{}, regex *GoRegex, f func(string) func([]interface{}) string, s string) string {
-	if regex != nil {
-	}
-	if regex == nil || regex.Re == nil {
-		return s
-	}
-	matches := regex.Re.FindAllStringSubmatchIndex(s, -1)
-	if !regex.Global && len(matches) > 1 {
-		matches = matches[:1]
-	}
-	if len(matches) == 0 {
-		return s
-	}
-
-	var sb strings.Builder
-	lastMatchEnd := 0
-	for _, matchIdxs := range matches {
-		fullMatch := s[matchIdxs[0]:matchIdxs[1]]
-		groups := make([]interface{}, 0)
-		for i := 2; i < len(matchIdxs); i += 2 {
-			if matchIdxs[i] == -1 {
-				groups = append(groups, nothing)
-			} else {
-				groups = append(groups, just(s[matchIdxs[i]:matchIdxs[i+1]]))
+// Name every capture by its JS ordinal, including named captures. This avoids
+// .NET's "unnamed groups first" numbering while retaining named references.
+func regexPattern(source string, unicode bool, multiline bool, dotAll bool) (string, map[string]int, error) {
+	names := make(map[string]int)
+	var b strings.Builder
+	inClass, ordinal := false, 0
+	rs := regexRunes(source, unicode)
+	for i := 0; i < len(rs); i++ {
+		c := rs[i]
+		if c == '\\' && i+1 < len(rs) {
+			next := rs[i+1]
+			if unicode && next == 'u' && i+11 < len(rs) && rs[i+6] == '\\' && rs[i+7] == 'u' {
+				hi, e1 := strconv.ParseUint(string(rs[i+2:i+6]), 16, 16)
+				lo, e2 := strconv.ParseUint(string(rs[i+8:i+12]), 16, 16)
+				if e1 == nil && e2 == nil && hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff {
+					b.WriteRune(utf16.DecodeRune(rune(hi), rune(lo)))
+					i += 11
+					continue
+				}
+			}
+			if next >= 'A' && next <= 'Z' || next >= 'a' && next <= 'z' {
+				known := strings.ContainsRune("bBcdDfnrsStuvwWxk", next) || unicode && (next == 'p' || next == 'P')
+				if !known {
+					if unicode {
+						return "", nil, fmt.Errorf("invalid Unicode identity escape \\%c", next)
+					}
+					b.WriteRune(next)
+					i++
+					continue
+				}
+			}
+			b.WriteRune(c)
+			i++
+			b.WriteRune(rs[i])
+			continue
+		}
+		if c == '[' && !inClass {
+			inClass = true
+		} else if c == ']' && inClass {
+			inClass = false
+		}
+		if !inClass {
+			switch c {
+			case '.':
+				if !dotAll {
+					b.WriteString(`[^\r\n\u2028\u2029]`)
+					continue
+				}
+			case '^':
+				if multiline {
+					b.WriteString(`(?:\A|(?<=[\r\n\u2028\u2029]))`)
+					continue
+				}
+			case '$':
+				if multiline {
+					b.WriteString(`(?:\z|(?=[\r\n\u2028\u2029]))`)
+					continue
+				}
 			}
 		}
-
-		replacement := f(fullMatch)(groups)
-		sb.WriteString(s[lastMatchEnd:matchIdxs[0]])
-		sb.WriteString(replacement)
-		lastMatchEnd = matchIdxs[1]
+		if c == '(' && !inClass {
+			if i+1 < len(rs) && rs[i+1] == '?' {
+				if i+2 >= len(rs) {
+					return "", nil, fmt.Errorf("incomplete group")
+				}
+				switch rs[i+2] {
+				case ':', '=', '!':
+				case '<':
+					if i+3 < len(rs) && (rs[i+3] == '=' || rs[i+3] == '!') {
+						break
+					}
+					end := i + 3
+					for end < len(rs) && rs[end] != '>' {
+						end++
+					}
+					if end == len(rs) {
+						return "", nil, fmt.Errorf("unterminated capture name")
+					}
+					name := string(rs[i+3 : end])
+					if name == "" {
+						return "", nil, fmt.Errorf("empty capture name")
+					}
+					for n, r := range name {
+						if !(r == '_' || r == '$' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || n > 0 && r >= '0' && r <= '9') {
+							return "", nil, fmt.Errorf("unsupported capture name %q", name)
+						}
+					}
+					if _, exists := names[name]; exists {
+						return "", nil, fmt.Errorf("duplicate capture name %q", name)
+					}
+					ordinal++
+					names[name] = ordinal
+					fmt.Fprintf(&b, "(?<%d>", ordinal)
+					i = end
+					continue
+				default:
+					return "", nil, fmt.Errorf("unsupported group construct")
+				}
+			} else {
+				ordinal++
+				fmt.Fprintf(&b, "(?<%d>", ordinal)
+				continue
+			}
+		}
+		if c >= 0xd800 && c <= 0xdfff {
+			fmt.Fprintf(&b, `\u%04x`, c)
+		} else {
+			b.WriteRune(c)
+		}
 	}
-	sb.WriteString(s[lastMatchEnd:])
-	return sb.String()
+	pattern := b.String()
+	// Resolve named backreferences only outside escaped text and character classes.
+	b.Reset()
+	inClass = false
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		if c == '\\' && i+1 < len(pattern) {
+			if !inClass && strings.HasPrefix(pattern[i:], `\k<`) {
+				end := strings.IndexByte(pattern[i+3:], '>')
+				if end < 0 {
+					return "", nil, fmt.Errorf("unterminated named reference")
+				}
+				name := pattern[i+3 : i+3+end]
+				n, exists := names[name]
+				if !exists {
+					return "", nil, fmt.Errorf("unknown capture name %q", name)
+				}
+				fmt.Fprintf(&b, `\%d`, n)
+				i += 3 + end
+				continue
+			}
+			b.WriteByte(c)
+			i++
+			b.WriteByte(pattern[i])
+			continue
+		}
+		if c == '[' {
+			inClass = true
+		} else if c == ']' {
+			inClass = false
+		}
+		b.WriteByte(c)
+	}
+	return b.String(), names, nil
 }
 
-func Replace(regex *GoRegex, s1 string, s2 string) string {
-	if regex == nil || regex.Re == nil {
-		return s2
+// regexp2 retains captures from earlier repetitions where JS clears them.
+// Reject repeating groups containing nested captures rather than silently
+// returning stale captures or using them in a later backreference.
+func regexCheckRepeatingCaptures(source string) error {
+	stack := []int{}
+	captures := 0
+	inClass := false
+	for i := 0; i < len(source); i++ {
+		c := source[i]
+		if c == '\\' {
+			i++
+			continue
+		}
+		if c == '[' {
+			inClass = true
+		}
+		if c == ']' {
+			inClass = false
+			continue
+		}
+		if inClass {
+			continue
+		}
+		if c == '(' {
+			capturing := i+1 == len(source) || source[i+1] != '?'
+			if strings.HasPrefix(source[i:], "(?<") && i+3 < len(source) && source[i+3] != '=' && source[i+3] != '!' {
+				capturing = true
+			}
+			if capturing {
+				captures++
+			}
+			stack = append(stack, captures)
+		}
+		if c == ')' && len(stack) > 0 {
+			start := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if captures > start && i+1 < len(source) && strings.ContainsRune("*+{", rune(source[i+1])) {
+				return fmt.Errorf("repeated groups with nested captures are not supported by the native regex engine")
+			}
+		}
 	}
-	if regex.Global {
-		return regex.Re.ReplaceAllString(s2, s1)
-	}
-	
-	loc := regex.Re.FindStringSubmatchIndex(s2)
-	if loc == nil {
-		return s2
-	}
-	
-	var res []byte
-	res = append(res, s2[:loc[0]]...)
-	res = regex.Re.ExpandString(res, s1, s2, loc)
-	res = append(res, s2[loc[1]:]...)
-	return string(res)
+	return nil
 }
 
-func _Match(just func(interface{}) interface{}, nothing interface{}, r *GoRegex, s string) interface{} { 
-	if r == nil || r.Re == nil {
-		return nothing
+func RegexImpl(left func(string) any, right func(any) any, source string, flags string) any {
+	if err := regexCheckRepeatingCaptures(source); err != nil {
+		return left(err.Error())
 	}
-	if r.Global {
-		matches := r.Re.FindAllString(s, -1)
-		if len(matches) == 0 {
-			return nothing
+	opts := regexp2.RegexOptions(regexp2.ECMAScript)
+	seen := make(map[rune]bool)
+	for _, f := range flags {
+		if seen[f] {
+			return left(fmt.Sprintf("duplicate regex flag %q", f))
 		}
-		var result []interface{}
-		for _, m := range matches {
-			result = append(result, just(m))
+		seen[f] = true
+		switch f {
+		case 'g', 'y':
+		case 'i':
+			opts |= regexp2.IgnoreCase
+		case 'm':
+			opts |= regexp2.Multiline
+		case 's':
+			opts |= regexp2.Singleline
+		case 'u':
+			opts |= regexp2.Unicode
+		default:
+			return left(fmt.Sprintf("unsupported regex flag %q", f))
 		}
-		return just(result)
-	} else {
-		locs := r.Re.FindStringSubmatchIndex(s)
+	}
+	pattern, names, err := regexPattern(source, seen['u'], seen['m'], seen['s'])
+	if err != nil {
+		return left(err.Error())
+	}
+	re, err := regexp2.Compile(pattern, opts)
+	if err != nil {
+		return left(err.Error())
+	}
+	// Pure Regex operations have no Either error channel. Surface timeout as an
+	// exception, never as false/Nothing/a partial result. The clock is approximate.
+	re.MatchTimeout = time.Second
+	canonicalFlags := ""
+	for _, f := range "gimsuy" {
+		if seen[f] {
+			canonicalFlags += string(f)
+		}
+	}
+	return right(&GoRegex{Re: re, Global: seen['g'], Flags: canonicalFlags, Source: source, names: names, cst: regexCST(source, canonicalFlags)})
+}
+
+// Only these exact, Unicode-only lexer expressions use Go's linear engine.
+// Their syntax and captures have a direct translation; the two reductions are
+// checked separately. General RE2 compile success is not a compatibility proof.
+// This avoids converting the entire remaining source to runes at every token.
+func regexCST(source, flags string) *regexp.Regexp {
+	if flags != "u" {
+		return nil
+	}
+	pattern := source
+	switch source {
+	case `^(?:--[^\r\n]*)`, `^(?:#![^\r\n]*)`, `^(?: +)`, "^(?:\n+)", "^(?:(?:\r\n)+)",
+		`^(?:(?:(?:\p{Lu}[\p{L}0-9_']*)\.)*)`, `^(?:\p{Lu}[\p{L}0-9_']*)`, `^(?:[\p{Ll}_][\p{L}0-9_']*)`,
+		`^(?:[a-fA-F0-9]{1,6})`, `^(?:\\[ \r\n]+\\)`, `^(?:[^"\\]+)`, `^(?:""""{0,2}([^"]+"{1,2})*[^"]*""")`,
+		`^(?:(0|[1-9][0-9_]*))`, `^(?:[0-9_]+)`, `^(?:[a-fA-F0-9]+)`:
+	case `^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|(?!\p{P})\p{S})+)`:
+		// P and S are disjoint; the negative lookahead is redundant.
+		pattern = `^(?:(?:[:!#$%&*+./<=>?@\\^|~-]|\p{S})+)`
+	case `^(?:\{-(-(?!\})|[^-]+)*(-\}|$))`:
+		// Prefer the closing delimiter before repeating. Preserve both captures.
+		pattern = `^(?:\{-(-|[^-]+)*?(-\}|$))`
+	default:
+		return nil
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		panic(fmt.Errorf("invalid qualified CST expression: %w", err))
+	}
+	return re
+}
+
+func regexFind(r *GoRegex, input []rune, start int, sticky bool) *regexp2.Match {
+	m, err := r.Re.FindRunesMatchStartingAt(input, start)
+	if err != nil {
+		panic(fmt.Errorf("Data.String.Regex: %w", err))
+	}
+	if sticky && m != nil && m.Index != start {
+		return nil
+	}
+	return m
+}
+
+func regexMatches(r *GoRegex, input []rune, all bool) []*regexp2.Match {
+	var matches []*regexp2.Match
+	sticky := strings.Contains(r.Flags, "y")
+	for pos := 0; pos <= len(input); {
+		m := regexFind(r, input, pos, sticky)
+		if m == nil {
+			break
+		}
+		matches = append(matches, m)
+		if !all {
+			break
+		}
+		pos = m.Index + m.Length
+		if m.Length == 0 {
+			pos++
+		}
+	}
+	return matches
+}
+
+func regexGroups(m *regexp2.Match, just func(any) any, nothing any) []any {
+	groups := m.Groups()
+	out := make([]any, len(groups))
+	for i, g := range groups {
+		if len(g.Captures) == 0 {
+			out[i] = nothing
+		} else {
+			out[i] = just(regexString(g.Runes()))
+		}
+	}
+	return out
+}
+
+func _Match(just func(any) any, nothing any, r *GoRegex, s string) any {
+	if r.cst != nil {
+		locs := r.cst.FindStringSubmatchIndex(s)
 		if locs == nil {
 			return nothing
 		}
-		var result []interface{}
-		for i := 0; i < len(locs); i += 2 {
-			if locs[i] == -1 {
-				result = append(result, nothing)
+		out := make([]any, len(locs)/2)
+		for i := range out {
+			if locs[2*i] < 0 {
+				out[i] = nothing
 			} else {
-				result = append(result, just(s[locs[i]:locs[i+1]]))
+				out[i] = just(s[locs[2*i]:locs[2*i+1]])
 			}
 		}
-		return just(result)
+		return just(out)
 	}
-}
-
-func _Search(just func(interface{}) interface{}, nothing interface{}, r *GoRegex, s string) interface{} { 
-	if r == nil || r.Re == nil {
+	input := regexRunes(s, strings.Contains(r.Flags, "u"))
+	matches := regexMatches(r, input, r.Global)
+	if len(matches) == 0 {
 		return nothing
 	}
-	loc := r.Re.FindStringIndex(s)
-	if loc == nil {
+	if !r.Global {
+		return just(regexGroups(matches[0], just, nothing))
+	}
+	out := make([]any, len(matches))
+	for i, m := range matches {
+		out[i] = just(regexString(m.Runes()))
+	}
+	return just(out)
+}
+
+func _Search(just func(any) any, nothing any, r *GoRegex, s string) any {
+	input := regexRunes(s, strings.Contains(r.Flags, "u"))
+	m := regexFind(r, input, 0, strings.Contains(r.Flags, "y"))
+	if m == nil {
 		return nothing
 	}
-	return just(loc[0])
+	index := m.Index
+	if strings.Contains(r.Flags, "u") {
+		for _, c := range input[:m.Index] {
+			if c > 0xffff {
+				index++
+			}
+		}
+	}
+	return just(index)
 }
 
-func FlagsImpl(r *GoRegex) map[string]interface{} { 
-	if r == nil {
-		return map[string]interface{}{}
+func regexReplace(r *GoRegex, s string, replacement func(*regexp2.Match, []rune) string) string {
+	input := regexRunes(s, strings.Contains(r.Flags, "u"))
+	matches := regexMatches(r, input, r.Global)
+	var b strings.Builder
+	end := 0
+	for _, m := range matches {
+		b.WriteString(regexString(input[end:m.Index]))
+		b.WriteString(replacement(m, input))
+		end = m.Index + m.Length
 	}
-	return map[string]interface{}{
-		"global": r.Global,
-		"ignoreCase": strings.Contains(r.Flags, "i"),
-		"multiline": strings.Contains(r.Flags, "m"),
-		"dotAll": strings.Contains(r.Flags, "s"),
-		"sticky": false,
-		"unicode": true,
-	}
+	b.WriteString(regexString(input[end:]))
+	return regexString(regexRunes(b.String(), false))
 }
 
-func ShowRegexImpl(r *GoRegex) string { 
-	if r == nil {
-		return "//"
-	}
-	return "/" + r.Source + "/" + r.Flags
+func _ReplaceBy(just func(any) any, nothing any, r *GoRegex, f func(string) func([]any) string, s string) string {
+	return regexReplace(r, s, func(m *regexp2.Match, _ []rune) string {
+		return f(regexString(m.Runes()))(regexGroups(m, just, nothing)[1:])
+	})
 }
 
-func Source(r *GoRegex) string { 
-	if r == nil {
-		return ""
-	}
-	return r.Source 
+func Replace(r *GoRegex, replacement string, s string) string {
+	return regexReplace(r, s, func(m *regexp2.Match, input []rune) string {
+		var b strings.Builder
+		groups := m.Groups()
+		for i := 0; i < len(replacement); i++ {
+			if replacement[i] != '$' || i+1 == len(replacement) {
+				b.WriteByte(replacement[i])
+				continue
+			}
+			next := replacement[i+1]
+			switch next {
+			case '$':
+				b.WriteByte('$')
+				i++
+			case '&':
+				b.WriteString(regexString(m.Runes()))
+				i++
+			case '`':
+				b.WriteString(regexString(input[:m.Index]))
+				i++
+			case '\'':
+				b.WriteString(regexString(input[m.Index+m.Length:]))
+				i++
+			case '<':
+				end := strings.IndexByte(replacement[i+2:], '>')
+				if len(r.names) == 0 || end < 0 {
+					b.WriteByte('$')
+					continue
+				}
+				name := replacement[i+2 : i+2+end]
+				if n, ok := r.names[name]; ok {
+					b.WriteString(regexString(groups[n].Runes()))
+				}
+				i += end + 2
+			default:
+				if next < '0' || next > '9' {
+					b.WriteByte('$')
+					continue
+				}
+				n, width := int(next-'0'), 1
+				if i+2 < len(replacement) && replacement[i+2] >= '0' && replacement[i+2] <= '9' {
+					n2 := n*10 + int(replacement[i+2]-'0')
+					if n2 > 0 && n2 < len(groups) {
+						n, width = n2, 2
+					}
+				}
+				if n == 0 || n >= len(groups) {
+					b.WriteByte('$')
+					continue
+				}
+				if len(groups[n].Captures) > 0 {
+					b.WriteString(regexString(groups[n].Runes()))
+				}
+				i += width
+			}
+		}
+		return b.String()
+	})
 }
 
-func Split(r *GoRegex, s string) []string { 
-	if r == nil || r.Re == nil {
-		return []string{s}
+func Split(r *GoRegex, s string) []string {
+	input := regexRunes(s, strings.Contains(r.Flags, "u"))
+	if len(input) == 0 {
+		if regexFind(r, input, 0, true) != nil {
+			return []string{}
+		}
+		return []string{""}
 	}
-	return r.Re.Split(s, -1)
+	out := []string{}
+	last, pos := 0, 0
+	for pos < len(input) {
+		m := regexFind(r, input, pos, true)
+		if m == nil {
+			pos++
+			continue
+		}
+		end := m.Index + m.Length
+		if end == last {
+			pos++
+			continue
+		}
+		out = append(out, regexString(input[last:m.Index]))
+		for _, g := range m.Groups()[1:] {
+			if len(g.Captures) == 0 {
+				panic("Data.String.Regex.split: unmatched captures cannot inhabit Array String")
+			}
+			out = append(out, regexString(g.Runes()))
+		}
+		last, pos = end, end
+	}
+	return append(out, regexString(input[last:]))
 }
 
-func Test(r *GoRegex, s string) bool { 
-	if r == nil || r.Re == nil {
-		return false
-	}
-	return r.Re.MatchString(s)
+func Test(r *GoRegex, s string) bool {
+	return regexFind(r, regexRunes(s, strings.Contains(r.Flags, "u")), 0, strings.Contains(r.Flags, "y")) != nil
 }
+
+func FlagsImpl(r *GoRegex) map[string]any {
+	return map[string]any{"global": r.Global, "ignoreCase": strings.Contains(r.Flags, "i"), "multiline": strings.Contains(r.Flags, "m"), "dotAll": strings.Contains(r.Flags, "s"), "sticky": strings.Contains(r.Flags, "y"), "unicode": strings.Contains(r.Flags, "u")}
+}
+
+func Source(r *GoRegex) string {
+	if r.Source == "" {
+		return "(?:)"
+	}
+	var b strings.Builder
+	escaped := false
+	for _, c := range regexRunes(r.Source, true) {
+		switch c {
+		case '/':
+			if !escaped {
+				b.WriteByte('\\')
+			}
+			b.WriteRune(c)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case 0x2028, 0x2029:
+			b.WriteString(`\u` + strconv.FormatInt(int64(c), 16))
+		default:
+			b.WriteString(regexString([]rune{c}))
+		}
+		if c == '\\' {
+			escaped = !escaped
+		} else {
+			escaped = false
+		}
+	}
+	return b.String()
+}
+
+func ShowRegexImpl(r *GoRegex) string { return "/" + Source(r) + "/" + r.Flags }
